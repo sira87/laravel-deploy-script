@@ -90,6 +90,11 @@ install_dependencies() {
         "nginx"
         "git"
         "mysql-server"
+        "supervisor"
+        "ufw"
+        "fail2ban"
+        "unattended-upgrades"
+        "apt-listchanges"
     )
 
     local php_extensions=(
@@ -129,6 +134,36 @@ install_dependencies() {
     if ! command_exists certbot; then
         handle_error "Certbot installation failed. Please check the logs." 1
     fi
+
+    echo "Setting up AWS CLI..."
+    if ! command_exists aws; then
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip awscliv2.zip
+        sudo ./aws/install
+    fi
+}
+
+configure_firewall() {
+    echo "Configuring firewall..."
+    ufw allow OpenSSH
+    ufw allow "Nginx Full"
+    ufw --force enable
+    log_message "Firewall configured"
+}
+
+configure_fail2ban() {
+    echo "Configuring Fail2Ban..."
+    cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local
+    systemctl enable fail2ban
+    systemctl start fail2ban
+    log_message "Fail2Ban configured"
+}
+
+enable_auto_updates() {
+    echo "Enabling automatic security updates..."
+    apt-get install -y unattended-upgrades apt-listchanges
+    dpkg-reconfigure -plow unattended-upgrades
+    log_message "Automatic security updates enabled"
 }
 
 check_php_version() {
@@ -162,8 +197,16 @@ create_website_directory() {
     echo "Creating website directory..."
     mkdir -p "$website_dir"
     chown -R "$username:$username" "$website_dir"
-    chmod -R 755 "$website_dir"
+    set_permissions "$website_dir"
     log_message "Website directory $website_dir created"
+}
+
+set_permissions() {
+    local directory=$1
+
+    find "$directory" -type d -exec chmod 755 {} \;
+    find "$directory" -type f -exec chmod 644 {} \;
+    chmod -R g+w "$directory/storage" "$directory/bootstrap/cache"
 }
 
 create_database() {
@@ -176,7 +219,7 @@ create_database() {
     local query_status=$(mysql -u root -p$mysql_root_password <<-EOF
     CREATE DATABASE IF NOT EXISTS \`$db_name\`;
     CREATE USER '\`$db_user\`'@'localhost' IDENTIFIED BY '\`$db_pass\`';
-    GRANT ALL PRIVILEGES ON \`$db_name\`.* TO '\`$db_user\`'@'localhost';
+    GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX ON \`$db_name\`.* TO '\`$db_user\`'@'localhost';
     FLUSH PRIVILEGES;
 EOF
 )
@@ -187,6 +230,7 @@ EOF
         exit 1
     fi
 }
+
 
 clone_repository() {
     local repository=$1
@@ -210,6 +254,7 @@ configure_nginx() {
     local nginx_config=$(cat <<-EOF
     server {
         listen 80;
+        listen [::]:80;
         server_name $server_name;
         root $website_dir/public;
 
@@ -284,7 +329,7 @@ laravel_post_deployment() {
     pushd "$directory"
     cp .env.example .env
     chown -R www-data:www-data storage bootstrap/cache
-    chmod -R 755 storage bootstrap/cache
+    set_permissions "$directory/storage" "$directory/bootstrap/cache"
     php artisan key:generate
     php artisan migrate --force
     php artisan config:cache
@@ -297,10 +342,87 @@ laravel_post_deployment() {
     sed -i "s/DB_DATABASE=.*/DB_DATABASE=$db_name/g" .env
     sed -i "s/DB_USERNAME=.*/DB_USERNAME=$db_user/g" .env
     sed -i "s/DB_PASSWORD=.*/DB_PASSWORD=$db_pass/g" .env
+
+    # Additional Secure PHP Settings
+    echo "SESSION_SECURE_COOKIE=true" >> .env
+    echo "SESSION_HTTP_ONLY=true" >> .env
+    echo "SESSION_SAME_SITE=lax" >> .env
+    echo "SESSION_COOKIE_SECURE=true" >> .env
+    echo "SESSION_COOKIE_HTTP_ONLY=true" >> .env
+
     popd
     log_message "Post-deployment Laravel setup complete"
 }
 
+configure_supervisor() {
+    local username=$1
+    local website_dir=$2
+
+    echo "Configuring Supervisor..."
+    local supervisor_config=$(cat <<-EOF
+    [program:laravel-worker]
+    process_name=%(program_name)s_%(process_num)02d
+    command=php $website_dir/artisan queue:work --sleep=3 --tries=3 --daemon
+    autostart=true
+    autorestart=true
+    user=$username
+    numprocs=1
+    redirect_stderr=true
+    stdout_logfile=$website_dir/worker.log
+EOF
+)
+
+    echo "$supervisor_config" > "/etc/supervisor/conf.d/laravel-worker.conf"
+    supervisorctl reread
+    supervisorctl update
+    supervisorctl start laravel-worker
+    log_message "Supervisor configured for Laravel queues"
+}
+
+configure_aws_cli() {
+    echo "Configuring AWS CLI..."
+    if ! command_exists aws; then
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip awscliv2.zip
+        sudo ./aws/install
+    fi
+    log_message "AWS CLI configured"
+}
+
+create_s3_bucket() {
+    local bucket_name=$1
+
+    echo "Creating S3 bucket..."
+    aws s3api create-bucket --bucket "$bucket_name" --region us-east-1
+    if [ $? -ne 0 ]; then
+        handle_error "Failed to create S3 bucket. Please check the logs." 1
+    fi
+    log_message "S3 bucket $bucket_name created"
+}
+
+configure_daily_database_backup() {
+    local db_name=$1
+    local db_user=$2
+    local db_pass=$3
+    local bucket_name=$4
+
+    echo "Configuring daily database backup to S3..."
+    local backup_script=$(cat <<-EOF
+    #!/bin/bash
+    mysqldump -u$db_user -p$db_pass $db_name | gzip > /tmp/db_backup.sql.gz
+    aws s3 cp /tmp/db_backup.sql.gz s3://$bucket_name/db_backup_\$(date +"%Y%m%d%H%M%S").sql.gz
+    rm /tmp/db_backup.sql.gz
+EOF
+)
+
+    echo "$backup_script" > "/usr/local/bin/database_backup.sh"
+    chmod +x "/usr/local/bin/database_backup.sh"
+
+    echo "Configuring cron job for daily database backup..."
+    local cron_job="0 3 * * * /usr/local/bin/database_backup.sh"
+    (crontab -l 2>/dev/null; echo "$cron_job") | crontab -
+    log_message "Daily database backup configured"
+}
 
 main() {
     local username=""
@@ -315,30 +437,50 @@ main() {
     local php_version=""
     local repository=""
     local website_dir="/var/www/html"
+    local s3_bucket_name=""
 
     prompt_input "Enter your desired username: " username
     validate_username "$username"
+
     prompt_input_secure "Enter your desired password: " password
     validate_password "$password"
-    prompt_input "Enter your domain name: " domain_name
+
+    prompt_input "Enter your domain name (e.g., example.com): " domain_name
     validate_domain_name "$domain_name"
-    prompt_input "Enter your email address: " email_address
+
+    prompt_input "Enter your email address for Let's Encrypt SSL certificate: " email_address
+
     prompt_input_secure "Enter MySQL root password: " mysql_root_password
     prompt_input_secure "Confirm MySQL root password: " mysql_root_password_confirm
     if [ "$mysql_root_password" != "$mysql_root_password_confirm" ]; then
-        handle_error "MySQL root passwords do not match." 1
+        echo "MySQL root password confirmation does not match."
+        exit 1
     fi
+
     prompt_input "Enter your desired database name: " db_name
     validate_database_name "$db_name"
-    prompt_input "Enter your desired database user: " db_user
+
+    prompt_input "Enter your desired database username: " db_user
     validate_username "$db_user"
+
     prompt_input_secure "Enter your desired database password: " db_pass
     validate_password "$db_pass"
-    prompt_input "Enter your PHP version (i.e., 7.4, 8.0): " php_version
-    prompt_input "Enter the URL of your Laravel project repository: " repository
 
-    website_dir="$website_dir/$username"
+    prompt_input "Enter the desired PHP version (e.g., 8.1): " php_version
+
+    prompt_input "Enter the repository URL for your Laravel application: " repository
+
+    prompt_input "Enter the desired directory for your Laravel application (default: /var/www/html): " website_dir
+
+    prompt_input "Enter the S3 bucket name for daily database backups (leave blank if not needed): " s3_bucket_name
+
+    echo "Starting deployment..."
+    log_message "Deployment started"
+
     install_dependencies "$php_version"
+    configure_firewall
+    configure_fail2ban
+    enable_auto_updates
     check_php_version "$php_version"
     create_user "$username" "$password"
     create_website_directory "$username" "$website_dir"
@@ -348,8 +490,15 @@ main() {
     install_composer_dependencies "$website_dir"
     setup_ssl "$domain_name" "$email_address"
     laravel_post_deployment "$website_dir" "$domain_name" "$db_name" "$db_user" "$db_pass"
+    configure_supervisor "$username" "$website_dir"
+
+    if [ -n "$s3_bucket_name" ]; then
+        configure_aws_cli
+        create_s3_bucket "$s3_bucket_name"
+        configure_daily_database_backup "$db_name" "$db_user" "$db_pass" "$s3_bucket_name"
+    fi
+
+    log_message "Deployment completed successfully"
 }
 
-main
-
-exit 0
+main "$@"
